@@ -26,6 +26,7 @@
 #define ElfN_Shdr    Elf64_Shdr
 #define ElfN_Phdr    Elf64_Phdr
 #define ElfN_Dyn     Elf64_Dyn
+#define ElfN_Rel     Elf64_Rel
 #define ElfN_Rela    Elf64_Rela
 #define ElfN_Sym     Elf64_Sym
 #define print_addr(format, ...) do {            \
@@ -41,6 +42,7 @@
 #define ElfN_Ehdr    Elf32_Ehdr
 #define ElfN_Shdr    Elf32_Shdr
 #define ElfN_Phdr    Elf32_Phdr
+#define ElfN_Rel     Elf32_Rel
 #define ElfN_Dyn     Elf32_Dyn
 #define ElfN_Rela    Elf32_Rela
 #define ElfN_Sym     Elf32_Sym
@@ -409,7 +411,6 @@ int rearrange_dynamic(char *elf, ElfN_Shdr *shdr, void *base, void *top,
     return 0;
 }
 
-
 /* Shifts the offsets of all relocation objects by n bytes,
  *  if they are between base and top.
  * Returns 0 on success and 1 on failure.
@@ -426,16 +427,28 @@ int rearrange_relocs(char *elf, void *base, void *top,
 
     /* Have to check every section */
     while((shdr = get_s_header(elf,sh_num++))) {
+        int num, i;
+        UWORD addr;
         if(shdr->sh_type == SHT_RELA) {
-            int num;
             num = shdr->sh_size / sizeof(ElfN_Rela);
-            int i;
             ElfN_Rela *rel;
             for(i = 0; i < num; i++) {
-                UWORD addr;
                 addr = ((UWORD)elf + shdr->sh_offset 
                         + (i * sizeof(ElfN_Rela)));
                 rel = (ElfN_Rela *)addr;
+                if((UWORD)rel->r_offset >= (UWORD)base
+                        && (UWORD)rel->r_offset < (UWORD)top) {
+                    rel->r_offset += n;
+                }
+            }
+        }
+        else if(shdr->sh_type == SHT_REL) {
+            num = shdr->sh_size / sizeof(ElfN_Rel);
+            ElfN_Rel *rel;
+            for(i = 0; i < num; i++) {
+                addr = ((UWORD)elf + shdr->sh_offset 
+                        + (i * sizeof(ElfN_Rel)));
+                rel = (ElfN_Rel *)addr;
                 if((UWORD)rel->r_offset >= (UWORD)base
                         && (UWORD)rel->r_offset < (UWORD)top) {
                     rel->r_offset += n;
@@ -460,9 +473,10 @@ int rearrange_syms(char *elf, void *base, void *top,
     sh_num = 0;
     ElfN_Shdr *shdr;
 
-    /* Have to check every section */
     while((shdr = get_s_header(elf,sh_num++))) {
-        if(shdr->sh_type == SHT_DYNSYM) {
+        /* Concerned with dynamic and regular symbol tables */
+        if(shdr->sh_type == SHT_DYNSYM 
+                || shdr->sh_type == SHT_SYMTAB) {
             int num;
             num = shdr->sh_size / sizeof(ElfN_Sym);
             int i;
@@ -485,6 +499,69 @@ int rearrange_syms(char *elf, void *base, void *top,
     return 0;
 }
 
+/*
+ * Move sections in memory based on the difference in their 
+ *  offsets from the original ELF.
+ * The section header table may also be moved if it is at risk
+ *  of overwrite.
+ * Returns 0 on success and 1 on failure.
+ */
+int move_sections(char *elf, char *new_elf)
+{
+    if(!elf || !new_elf)
+        return 1;
+    ElfN_Ehdr *ehdr;
+    ElfN_Ehdr *new_ehdr;
+    ehdr = (ElfN_Ehdr *)elf;
+    new_ehdr = (ElfN_Ehdr *)new_elf;
+    if(ehdr->e_shnum != new_ehdr->e_shnum)
+        return 1;
+
+    UWORD sht_loc;
+    sht_loc = (UWORD)new_elf + new_ehdr->e_shoff;
+    UWORD sht_sz;
+    sht_sz = new_ehdr->e_shnum * new_ehdr->e_shentsize;
+
+    int i;
+    ElfN_Shdr *shdr;
+    ElfN_Shdr *new_shdr;
+    /* Work backwards since we're shifting data strictly up */
+    for(i = ehdr->e_shnum-1; i >= 0; i--) {
+        shdr = get_s_header(elf,i);
+        new_shdr = get_s_header(new_elf,i);
+        if(!shdr || !new_shdr)
+            return 1;
+        
+        WORD diff;
+        UWORD sz;
+        diff = new_shdr->sh_offset - shdr->sh_offset;
+        if(diff < 0)
+            return 1;
+        if(diff == 0)
+            continue;
+        sz = new_shdr->sh_size;
+
+        UWORD shdr_addr;
+        shdr_addr = (UWORD)new_elf + new_shdr->sh_offset - diff;
+        /* Check if we're stomping our header table */
+        if(shdr_addr + sz > sht_loc) {
+            /* Move the header table by this amount */
+            memmove((void *)sht_loc + diff,
+                    (void *)sht_loc,
+                    sht_sz);
+            /* Also update the reference to the header */
+            new_ehdr->e_shoff += diff;
+            sht_loc += diff;
+        }
+        /* Now we can move the section */ 
+        memmove((void *)shdr_addr + diff,
+                (void *)shdr_addr,
+                sz);
+    }
+
+    return 0;
+}
+
 /* 
  * Shift back all sections following a given one by n bytes,
  *  updating their offsets (and possibly addresses).
@@ -492,16 +569,19 @@ int rearrange_syms(char *elf, void *base, void *top,
  *  section to the next aligned boundary by a bias.
  * Returns the introduced bias on success. 
  */
-int shift_sh_offsets(char *elf, ElfN_Shdr *shdr, ElfN_Shdr *dyn_shdr, 
-        size_t n, size_t bias)
+int shift_sh_offsets(char *elf, ElfN_Shdr *shdr, 
+        ElfN_Shdr *dyn_shdr, size_t n, size_t bias)
 {
     if(!elf || !shdr)
-        return 1;
+        return 0;
 
     int i;
     i = shdr_index(elf, shdr);
     if(i == -1)
-        return 1;
+        return 0;
+
+    ElfN_Ehdr *ehdr;
+    ehdr = (ElfN_Ehdr *)elf;
 
     ElfN_Shdr *shdr_next;
     shdr_next = get_s_header(elf, i+1);
@@ -512,31 +592,17 @@ int shift_sh_offsets(char *elf, ElfN_Shdr *shdr, ElfN_Shdr *dyn_shdr,
     if(shdr_next->sh_flags & SHF_ALLOC && shdr_next->sh_addralign) {
         /* Set bias to the next aligned value */
         if(bias % shdr_next->sh_addralign) {
-            /* Bias set to the next aligned value */
             bias += shdr_next->sh_addralign;
             bias -= (bias % shdr_next->sh_addralign);
         }
     }
 
-    /* Relocatable objects in the section are also shifted */
-    rearrange_relocs(elf,
-            (void *)shdr_next->sh_addr,
-            (void *)shdr_next->sh_addr + shdr_next->sh_size,
-            bias);
-    /* Symbols are updated too */
-    rearrange_syms(elf,
-            (void *)shdr_next->sh_addr,
-            (void *)shdr_next->sh_addr + shdr_next->sh_size,
-            bias);
+    bias = shift_sh_offsets(elf,shdr_next,dyn_shdr,n,bias);
 
-    /* Increment the offset of the section */
-    shdr_next->sh_offset += n;
-
-    int ret;
-    ret = shift_sh_offsets(elf,shdr_next,dyn_shdr,n,bias);
     /* Any dynamic objects that live in this section
      * must be shifted; do this after to guarantee we don't
      * shift our dyn table */
+    
     if(dyn_shdr) {
         rearrange_dynamic(elf, dyn_shdr,
                 (void *)shdr_next->sh_addr,
@@ -544,39 +610,70 @@ int shift_sh_offsets(char *elf, ElfN_Shdr *shdr, ElfN_Shdr *dyn_shdr,
                 bias);
     }
 
-    /* Now we can inc the address by the bias */
-    shdr_next->sh_addr += bias;
-    return ret;
+    /* Now we can inc the offset and address by the bias */
+    shdr_next->sh_offset += bias;
+    if(shdr_next->sh_addr) 
+        shdr_next->sh_addr += bias;
+
+    return bias;
 }
 
 
 /* Expands the given section by n bytes by increasing its size.
- * Any following sections will have their offsets increased.
+ * Any following sections will have their offsets increased, and 
+ *  their actual memory moved to correlate.
  * Any following loaded sections will have their address increased,
  *  with alignment  maintained.
  * Any dynamic objects will have their addresses increased if 
  *  their address is after this section's start.
- * Returns 0 on success, 1 on failure.
+ * Returns the introduced bias on success or 0 on failure.
  */
-int expand_section(char *elf, ElfN_Shdr *shdr, ElfN_Shdr *dyn_shdr, 
-        size_t n)
+int expand_section(char *old_elf, char *elf, ElfN_Shdr *shdr, 
+        ElfN_Shdr *dyn_shdr, size_t n)
 {
     if(!elf || !shdr)
-        return 1;
+        return 0;
     if(dyn_shdr) {
         if(dyn_shdr->sh_type != SHT_DYNAMIC)
-            return 1;
+            return 0;
     }
 
-    int i;
-    i = shdr_index(elf,shdr);
-    if(i == -1)
-        return 1;
+    int shdr_ind;
+    shdr_ind = shdr_index(elf,shdr);
+    if(shdr_ind == -1)
+        return 0;
 
     shdr->sh_size += n;
-    shift_sh_offsets(elf, shdr, dyn_shdr, n, n);
+    int ret;
+    ret = shift_sh_offsets(elf, shdr, dyn_shdr, n, n);
+    ElfN_Ehdr *ehdr;
+    ehdr = (ElfN_Ehdr *)elf;
 
-    return 0;
+    /* Also expand and shift segments */
+    UWORD shdata_addr;
+    shdata_addr = (UWORD)elf + shdr->sh_offset;
+    expand_segments(elf,(void *)shdata_addr,ret);
+
+    /* We may have to shift our header table */
+    int off;
+    if(ret > n)
+        off = ret;
+    else
+        off = n;
+    off += 8;
+    off -= (off % 8);
+    UWORD shtab_addr;
+    shtab_addr = (UWORD)elf+ ehdr->e_shoff;
+    UWORD shtab_sz;
+    shtab_sz = ehdr->e_shnum * ehdr->e_shentsize;
+    memmove((void *)shtab_addr + off,
+            (void *)shtab_addr,
+            shtab_sz);
+    ehdr->e_shoff += off;
+    if(move_sections(old_elf, elf))
+        return 0;
+
+    return off; 
 }
 
 /* Injects a new section into the ELF loaded into 'elf',
@@ -615,121 +712,22 @@ int inject_section(char *elf, size_t elf_sz, char *dat,
     *dst = malloc(sz);
     if(!*dst) 
         goto fail;
+    
+    char *new_elf;
+    new_elf = *dst;
 
-    /* How many bytes have been copied from the ELF */
-    UWORD bytes_copied; 
-    bytes_copied = 0;
     /* How many bytes we have written to the new ELF */
     UWORD bytes_written;
     bytes_written = 0;
     WORD bytes_to_copy;
 
-    char *new_elf;
-    new_elf = *dst;
-
-    /* Copy in the EHDR and PHDR table */
-    bytes_to_copy = ehdr->e_phoff +
-        (ehdr->e_phentsize * ehdr->e_phnum); 
+    /* Copy in the new ELF */
+    bytes_to_copy = elf_sz;
     memcpy(new_elf, elf, bytes_to_copy);
-    bytes_copied += bytes_to_copy;
     bytes_written += bytes_to_copy;
 
     ElfN_Ehdr *new_ehdr;
     new_ehdr = (ElfN_Ehdr *)new_elf;
-
-    /* Starting at the executable segment header, increment the offset
-     * held in each program header to make room for the new data
-     * until they are all non-overlapping and aligned.*/
-    ElfN_Phdr *exec_phdr;
-    exec_phdr = find_exec_phdr(new_elf);
-    if(!exec_phdr)
-        goto fail;
-
-
-    /* Copy everything to the start of the .text section */
-    ElfN_Shdr *text_shdr;
-    text_shdr = find_section_hdr(elf, ".text");
-    if(!text_shdr)
-        goto fail;
-    UWORD start_of_text;
-    start_of_text = (UWORD)elf + text_shdr->sh_offset;
-    bytes_to_copy = start_of_text - (UWORD)elf - bytes_copied;
-    memcpy(new_elf+bytes_written, 
-            elf+bytes_copied, 
-            bytes_to_copy);
-    bytes_copied += bytes_to_copy;
-    bytes_written += bytes_to_copy;
-
-    /* Inject our new code and mark its offset */
-    UWORD new_code_offset = bytes_written;
-    bytes_to_copy = dat_sz;
-    memcpy(new_elf+bytes_written,
-            dat,
-            bytes_to_copy);
-    bytes_written += bytes_to_copy;
-
-    /* Make room for a jmp instruction after */
-    new_elf[bytes_written] = JMP_INSTR;
-    UWORD jmp_dst_addr;
-    jmp_dst_addr = (UWORD)new_elf + bytes_written + 1;
-    int32_t *jmp_dst;
-    jmp_dst = (int32_t *)jmp_dst_addr;
-    bytes_written += REDIR_SZ;
-
-    /* Expand segments to make room for new code, and shift
-     * other segments as needed */
-    UWORD addr;
-    addr = (UWORD)new_elf + bytes_written - dat_sz - REDIR_SZ;
-    expand_segments(new_elf, 
-            (void *)addr,
-            dat_sz + REDIR_SZ);
-
-
-
-    /* Now copy everything to the end of the Section Header 
-     *  string table */
-    char *sh_strtab;
-    sh_strtab = find_sh_strtab(elf);
-    if(!sh_strtab)
-        goto fail;
-    ElfN_Shdr *strtab_header;
-    strtab_header = get_s_header(elf, ehdr->e_shstrndx);
-    bytes_to_copy = (UWORD) sh_strtab - (UWORD)elf - bytes_copied +
-        strtab_header->sh_size;
-    memcpy(new_elf+bytes_written,
-            elf+bytes_copied,
-            bytes_to_copy);
-    bytes_copied += bytes_to_copy;
-    bytes_written += bytes_to_copy;
-
-    /* Inject the new entry to the strtab */
-    int str_ind;
-    str_ind = strtab_header->sh_size;
-    bytes_to_copy = strlen(sect_name) + 1;
-    memcpy(new_elf+bytes_written,
-            sect_name,
-            bytes_to_copy);
-    bytes_written += bytes_to_copy;
-
-    /* Expands the segment offsets and sizes to account for the
-     * new strtab entry */
-    UWORD strtab_addr;
-    strtab_addr = (UWORD)elf + bytes_written - strlen(sect_name) + 1;
-    expand_segments(new_elf, 
-            (void*)strtab_addr, 
-            strlen(sect_name) + 1);
-
-    /* Copy up to the end of the section header table */
-    bytes_to_copy = ehdr->e_shoff + 
-        (ehdr->e_shentsize * ehdr->e_shnum) - bytes_copied;
-    memcpy(new_elf+bytes_written,
-            elf+bytes_copied,
-            bytes_to_copy);
-    bytes_copied += bytes_to_copy;
-    bytes_written += bytes_to_copy;
-
-    /* Update the sh_offset */
-    new_ehdr->e_shoff += (bytes_written - bytes_copied);
 
     /* If there's a dynamic section, make note of it */
     int has_dyn;
@@ -751,92 +749,134 @@ int inject_section(char *elf, size_t elf_sz, char *dat,
             goto fail;
     }
 
-    /* The new section is to be inserted before .text, 
-     * so update the offsets and addresses of sections .text
-     * and above */
-    int text_shdr_ind;
+    /* Mark where the new code goes */
+    ElfN_Shdr *text_shdr;
+    text_shdr = find_section_hdr(elf, ".text");
+    if(!text_shdr)
+        goto fail;
+    WORD text_shdr_ind;
+    int base_addr;
+    base_addr = text_shdr->sh_addr;
     text_shdr_ind = shdr_index(elf, text_shdr);
-    if(text_shdr_ind == -1)
+    UWORD code_loc;
+    code_loc = (UWORD)new_elf + text_shdr->sh_offset;
+    UWORD code_sz;
+    code_sz = dat_sz + REDIR_SZ;
+
+    ElfN_Shdr *new_sht;
+    new_sht = get_s_header(new_elf, ehdr->e_shstrndx);
+    if(!new_sht)
         goto fail;
-    ElfN_Shdr *new_text_shdr;
-    new_text_shdr = get_s_header(new_elf, text_shdr_ind);
-    if(!new_text_shdr)
+    
+    /* Mark where the new strtab goes */
+    UWORD shent_loc;
+    shent_loc = (UWORD)new_elf + new_sht->sh_offset 
+        + new_sht->sh_size;
+    UWORD shent_sz;
+    shent_sz = strlen(sect_name) + 1;
+
+    /* Make room for our new string table entry */
+    int bias;
+    bias = expand_section(elf,new_elf, new_sht, new_dyn_shdr,
+           shent_sz);
+    bytes_written += bias; 
+
+    /* Fix references in case header table moved */
+    new_sht = get_s_header(new_elf, ehdr->e_shstrndx);
+    if(!new_sht)
         goto fail;
-    /* Our new code starts where .text used to be */
-    UWORD new_code_addr = new_text_shdr->sh_addr;
+    text_shdr = get_s_header(new_elf, text_shdr_ind);
+    if(!text_shdr)
+        goto fail;
+    new_dyn_shdr = get_s_header(new_elf, dyn_shdr_ind);
+    if(!new_dyn_shdr)
+        goto fail;
+
+    /* Make room for the new code */
     ElfN_Shdr *prev_hdr;
     prev_hdr = get_s_header(new_elf, text_shdr_ind - 1);
     if(!prev_hdr)
         goto fail;
-    expand_section(new_elf, prev_hdr, new_dyn_shdr, 
-            dat_sz + REDIR_SZ);
+    bias = expand_section(elf,new_elf, prev_hdr, new_dyn_shdr, 
+            code_sz);
+    bytes_written += bias;
+
+    /* Fix references in case header table moved */
+    new_sht = get_s_header(new_elf, ehdr->e_shstrndx);
+    if(!new_sht)
+        goto fail;
+    text_shdr = get_s_header(new_elf, text_shdr_ind);
+    if(!text_shdr)
+        goto fail;
+    prev_hdr = get_s_header(new_elf, text_shdr_ind - 1);
+    if(!prev_hdr)
+        goto fail;
 
     /* Just undo the size increase for this section, 
      * since we're adding a new one instead */
     prev_hdr->sh_size -= (dat_sz + REDIR_SZ);
 
-    /* We also inserted a new entry in the strtab, so any sections
-     * after the .strtab must be similarly shifted */
-    ElfN_Shdr *new_sh_strtab_hdr;
-    new_sh_strtab_hdr = get_s_header(new_elf, new_ehdr->e_shstrndx);
-    if(!new_sh_strtab_hdr) 
-        goto fail;    
-    expand_section(new_elf, new_sh_strtab_hdr, new_dyn_shdr,
-            strlen(sect_name) + 1);
+    /* Now we can inject the new code */
+    bytes_to_copy = dat_sz;
+    memcpy((void *)code_loc,
+            dat,
+            bytes_to_copy);
+
+    /* Also inject a jump instruction, but leave the dst for now */
+    UWORD jmp_instr_addr;
+    jmp_instr_addr = (UWORD)code_loc + dat_sz;
+    char * jmp_instr;
+    jmp_instr = (char *)jmp_instr_addr;
+    jmp_instr[0] = JMP_INSTR;
+    UWORD jmp_dst_addr;
+    jmp_dst_addr = (UWORD)jmp_instr_addr + 1;
+    int32_t *jmp_dst;
+    jmp_dst = (int32_t *)jmp_dst_addr;
+
+    /* Insert the new strtab entry */
+    shent_loc = (UWORD)new_elf + new_sht->sh_offset 
+        + new_sht->sh_size;
+    shent_sz = strlen(sect_name) + 1;
+    shent_loc -= shent_sz;
+    int str_ind;
+    str_ind = new_sht->sh_size - shent_sz;
+    bytes_to_copy = shent_sz;
+    memcpy((void *)shent_loc,
+            sect_name,
+            bytes_to_copy);
+
+    /* Mark where the new section header will be */
+    UWORD new_shdr_loc;
+    new_shdr_loc = (UWORD)new_elf + new_ehdr->e_shoff 
+        + (ehdr->e_shentsize * ehdr->e_shnum);
 
     /* Insert our new section header at the end of the table */
-    UWORD new_shdr_addr;
-    new_shdr_addr = (UWORD)new_elf + bytes_written;
     ElfN_Shdr *new_shdr;
-    new_shdr = (ElfN_Shdr *)new_shdr_addr;
+    new_shdr = (ElfN_Shdr *)new_shdr_loc;
     memset(new_shdr, 0, sizeof(ElfN_Shdr));
     new_shdr->sh_name = str_ind; /* Name index in strtab */
     new_shdr->sh_type = SHT_PROGBITS; /* Contains prog code */
     new_shdr->sh_flags = SHF_EXECINSTR | SHF_ALLOC;
-    new_shdr->sh_addr = new_code_addr; 
-    new_shdr->sh_offset = new_code_offset; 
+    new_shdr->sh_offset = code_loc - (UWORD)new_elf; 
+    new_shdr->sh_addr = base_addr; 
     new_shdr->sh_size = dat_sz + REDIR_SZ;
-    new_shdr->sh_addralign = new_text_shdr->sh_addralign;
-
+    new_shdr->sh_addralign = 4;
     bytes_written += sizeof(ElfN_Shdr);
 
     /* Set the new entry point and increment the sh_num */
     new_ehdr->e_entry = new_shdr->sh_addr;
     new_ehdr->e_shnum++;
 
-    /* Copy the rest of the ELF in */
-    bytes_to_copy = elf_sz - bytes_copied;
-    if(bytes_to_copy) {
-        /* If there's anything after the SH table, then
-         * we need to make sure that we shift the offsets */
-        ElfN_Shdr *next;
-        int ind;
-        ind = 0;
-        while((next = get_s_header(new_elf, ind++))) {
-            if(next->sh_offset > (UWORD)new_ehdr->e_shoff)
-                next->sh_offset += sizeof(ElfN_Shdr);
-        }
-        if(bytes_to_copy + bytes_copied > sz)
-            goto fail;
-        memcpy(new_elf+bytes_written,
-                elf+bytes_copied,
-                bytes_to_copy);
-        bytes_copied += bytes_to_copy;
-        bytes_written += bytes_to_copy;
-    }
-
     /* Finally set the jmp target */
-    UWORD old_entry;
+    UWORD old_entry, new_entry;
     old_entry = ehdr->e_entry;
+    new_entry = new_ehdr->e_entry;
     uint32_t jmp_rel; 
-    jmp_rel = (uint32_t)old_entry - (uint32_t)new_shdr->sh_addr;
-    jmp_rel -= dat_sz;
-    jmp_rel -= REDIR_SZ;
+    jmp_rel = (uint32_t)old_entry - (uint32_t)new_entry;
+    jmp_rel -= code_sz;
     *jmp_dst = jmp_rel;
 
     return bytes_written;
-
-
 fail:
     return -1;
 }

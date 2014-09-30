@@ -1,19 +1,7 @@
-BITS 64
+bits 64
 section .text
 _start:
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    nop
-    mov eax, 1
+    xor eax, eax
+    xor ebx, ebx
+    inc eax
     int 0x80
-    jmp -28
