@@ -42,10 +42,10 @@
 #define ElfN_Ehdr    Elf32_Ehdr
 #define ElfN_Shdr    Elf32_Shdr
 #define ElfN_Phdr    Elf32_Phdr
-#define ElfN_Rel     Elf32_Rel
 #define ElfN_Dyn     Elf32_Dyn
+#define ElfN_Rel     Elf32_Rel
 #define ElfN_Rela    Elf32_Rela
-#define ElfN_Sym     Elf32_Sym
+#define ElfN_Sym     Elf64_Sym
 #define print_addr(format, ...) do {            \
     printf(format "0x%08x",                     \
             (unsigned int)__VA_ARGS__);         \
@@ -56,18 +56,6 @@ const char *SECT_NAME = ".evil";
 const char JMP_INSTR = ARCH_JUMP_INSTR;
 int REDIR_SZ = 5;
 UWORD BASE_ADDR = ARCH_BASE_ADDR;
-
-int print_bytes(unsigned char *buf, size_t num)
-{
-    int i = 0;
-    printf("0x");
-    for(i = 0; i < num; i++){
-        printf("%02x",(unsigned int)buf[i]);
-    }
-    printf("\n");
-
-    return 0;
-}
 
 /* Reads the entire contents of the file into memory
  * and returns a pointer to the containing buffer.
@@ -141,25 +129,6 @@ ElfN_Phdr *get_p_header(char *elf, unsigned int index)
         (ehdr->e_phentsize * index);
     return (ElfN_Phdr *)addr;
 }
-
-/*
- * Returns 1 if the address is within the segment described by phdr,
- * and 0 otherwise.
- */
-int in_segment(void *addr, ElfN_Phdr *phdr)
-{
-    if(!phdr)
-        return 0;
-
-    if((UWORD)addr > (UWORD)phdr->p_offset)
-        if((UWORD)addr < (UWORD)phdr->p_offset 
-                + (UWORD)phdr->p_filesz)
-            return 1;
-
-
-    return 0;
-}
-
 
 /*
  * Returns a pointer to the Section Header String Table for the 
@@ -291,34 +260,9 @@ int phdr_index(char *elf, ElfN_Phdr *phdr)
 
     return ind;
 }
-/* Returns a pointer to the Program Header for the first executable
- * (and LOADed) segment. Returns 0 otherwise.
- */
-ElfN_Phdr *find_exec_phdr(char *elf)
-{
-    if(!elf)
-        return 0;
 
-    ElfN_Ehdr *ehdr;
-    ehdr = (ElfN_Ehdr *)elf;
-
-    /* Check each Program Header for being executable */
-    ElfN_Phdr *phdr;
-    int i;
-    for(i = 0; i < ehdr->e_phnum; i++) {
-        phdr = get_p_header(elf,i); 
-        if(phdr->p_type == PT_LOAD &&
-                (phdr->p_flags & PF_X))
-            break;
-    }
-
-    if(i == ehdr->e_phnum)
-        return 0;
-
-    return phdr;
-}
-
-/* Expands the size of any segments containing addr by n bytes,
+/* 
+ * Expands the size of any segments containing addr by n bytes,
  *  by increasing its filesz (and memsz if it is loaded).
  * Segments starting after this one but not containing base are
  *  offset by n.
@@ -379,12 +323,13 @@ int expand_segments(char *elf, void *addr, size_t n)
     return 0;
 }
 
-/* Shifts the address of all dynamic section entries by n bytes,
- * if they are between base and top.
+/* 
+ * Shifts the address of all dynamic section entries by n bytes,
+ *  if they are between base and top.
  * Returns 0 on success, 1 on failure
  */
-int rearrange_dynamic(char *elf, ElfN_Shdr *shdr, void *base, void *top,
-        size_t n)
+int rearrange_dynamic(char *elf, ElfN_Shdr *shdr, void *base, 
+        void *top, size_t n)
 {
     if(!elf || !shdr)
         return 1;
@@ -411,9 +356,10 @@ int rearrange_dynamic(char *elf, ElfN_Shdr *shdr, void *base, void *top,
     return 0;
 }
 
-/* Shifts the offsets of all relocation objects by n bytes,
+/* 
+ * Shifts the address of all reloc objects by n bytes,
  *  if they are between base and top.
- * Returns 0 on success and 1 on failure.
+ * Returns 0 on success, 1 on failure
  */
 int rearrange_relocs(char *elf, void *base, void *top,
         size_t n)
@@ -460,8 +406,10 @@ int rearrange_relocs(char *elf, void *base, void *top,
     return 0;
 }
 
-/* Shifts the offsets of all symbols by n bytes,
+/* 
+ * Shifts the address of all symtab section entries by n bytes,
  *  if they are between base and top.
+ * Returns 0 on success, 1 on failure
  */
 int rearrange_syms(char *elf, void *base, void *top,
         size_t n)
@@ -553,6 +501,17 @@ int move_sections(char *elf, char *new_elf)
             new_ehdr->e_shoff += diff;
             sht_loc += diff;
         }
+
+        /* If this section contains relocatable objects
+         * that are referenced, then we need to increase
+         * their offset by diff */
+        if(new_shdr->sh_addr) {
+            rearrange_relocs(new_elf, 
+                    (void *)new_shdr->sh_addr,
+                    (void *)new_shdr->sh_addr + sz,
+                    diff);
+        }
+
         /* Now we can move the section */ 
         memmove((void *)shdr_addr + diff,
                 (void *)shdr_addr,
@@ -580,9 +539,6 @@ int shift_sh_offsets(char *elf, ElfN_Shdr *shdr,
     if(i == -1)
         return 0;
 
-    ElfN_Ehdr *ehdr;
-    ehdr = (ElfN_Ehdr *)elf;
-
     ElfN_Shdr *shdr_next;
     shdr_next = get_s_header(elf, i+1);
     if(!shdr_next) {
@@ -602,7 +558,6 @@ int shift_sh_offsets(char *elf, ElfN_Shdr *shdr,
     /* Any dynamic objects that live in this section
      * must be shifted; do this after to guarantee we don't
      * shift our dyn table */
-    
     if(dyn_shdr) {
         rearrange_dynamic(elf, dyn_shdr,
                 (void *)shdr_next->sh_addr,
@@ -619,11 +574,15 @@ int shift_sh_offsets(char *elf, ElfN_Shdr *shdr,
 }
 
 
-/* Expands the given section by n bytes by increasing its size.
- * Any following sections will have their offsets increased, and 
- *  their actual memory moved to correlate.
+/* 
+ * Expands the given section by n bytes by increasing its size.
+ * Any following sections will have their offsets increased and 
+ *  their file offset by this amount.
  * Any following loaded sections will have their address increased,
- *  with alignment  maintained.
+ *  with alignment maintained.
+ * The section header table may move during this process,
+ *  to prevent data loss- in this case, section header pointers
+ *  must be reassigned.
  * Any dynamic objects will have their addresses increased if 
  *  their address is after this section's start.
  * Returns the introduced bias on success or 0 on failure.
@@ -670,13 +629,95 @@ int expand_section(char *old_elf, char *elf, ElfN_Shdr *shdr,
             (void *)shtab_addr,
             shtab_sz);
     ehdr->e_shoff += off;
+
+    /* Move the actual data in the sections */
     if(move_sections(old_elf, elf))
         return 0;
 
     return off; 
 }
 
-/* Injects a new section into the ELF loaded into 'elf',
+/*
+ * Increments the value of sh_link for any header
+ *  that has sh_link greater than or equal to index.
+ * This is used when a new section is inserted at index,
+ *  to update the link index.
+ * Returns 1 on failure or 0 on success.
+ */
+int fix_sh_links(char *elf, size_t index) 
+{
+    if(!elf)
+        return 1;
+
+    ElfN_Shdr *shdr;
+    int i;
+    i = 0;
+    while((shdr = get_s_header(elf,i++))) {
+        if(shdr->sh_link >= index)
+            shdr->sh_link++;
+    }
+    return 0;
+}
+
+/* 
+ * Inserts a new section header entry at the given table
+ *  index, as long as this index is no greater than the
+ *  size of the table. Assumes that the table has at least
+ *  sizeof(ElfN_Shdr) bytes of free space after it. 
+ * Since some section headers may be moved during the insertion,
+ *  it is unsafe to assume that section header references will
+ *  still be valid after this process- they should be reassigned.
+ * Returns a pointer to the new entry on success, or NULL on 
+ *  failure.
+ */
+ElfN_Shdr *insert_section_hdr(char *elf, size_t index)
+{
+    if(!elf)
+        return NULL;
+
+    ElfN_Ehdr *ehdr;
+    ehdr = (ElfN_Ehdr *)elf;
+
+    if(index > ehdr->e_shnum)
+        return NULL;
+    
+    /* See if we need to update the section header string table
+     * index */
+    if(index <= ehdr->e_shstrndx)
+        ehdr->e_shstrndx += 1;
+    /* Also check if any headers after this one are referenced
+     *  by a relocation section with sh_link; if so, we need
+     *  to increment sh_link to account for the new index. 
+     */
+    fix_sh_links(elf, index);
+    /* Increment shnum */
+    ehdr->e_shnum++;
+
+    /* Move all of the table entries after index */
+    UWORD start_addr;
+    UWORD end_addr;
+    UWORD sz;
+    /* Starting from the current entry at index */
+    start_addr = (UWORD)elf + ehdr->e_shoff + 
+        (ehdr->e_shentsize * index);
+    /* Moved back by the size of an entry */
+    end_addr = start_addr + ehdr->e_shentsize;
+    /* Moving back shnum - index entries */
+    sz = ehdr->e_shentsize * (ehdr->e_shnum - index);
+    if(sz) {
+        memmove((void *)end_addr,
+                (void *)start_addr,
+                sz);
+    }
+    /* Zero the new header and return a reference */
+    memset((void *)start_addr, 0, ehdr->e_shentsize);
+    ElfN_Shdr *new_shdr;
+    new_shdr = (ElfN_Shdr *)start_addr;
+   return new_shdr; 
+}
+
+/* 
+ * Injects a new section into the ELF loaded into 'elf',
  *  writing to an expanded buffer and pointing *dst to this buffer.
  * Updates the SHT, PHT, and EHDR.
  *
@@ -749,26 +790,36 @@ int inject_section(char *elf, size_t elf_sz, char *dat,
             goto fail;
     }
 
-    /* Mark where the new code goes */
+    /* Mark where the new code goes - if there is a plt
+     * section, put it before that. If not, put it before
+     * .text (and if it has neither, abort)
+     */
+    WORD new_shdr_ind;
+    UWORD code_loc, code_sz, code_addr;
     ElfN_Shdr *text_shdr;
     text_shdr = find_section_hdr(elf, ".text");
     if(!text_shdr)
         goto fail;
-    WORD text_shdr_ind;
-    int base_addr;
-    base_addr = text_shdr->sh_addr;
-    text_shdr_ind = shdr_index(elf, text_shdr);
-    UWORD code_loc;
-    code_loc = (UWORD)new_elf + text_shdr->sh_offset;
-    UWORD code_sz;
+    ElfN_Shdr *plt_shdr;
+    plt_shdr = find_section_hdr(elf, ".plt");
+    if(!plt_shdr) {
+        code_loc = (UWORD)new_elf + text_shdr->sh_offset;
+        code_addr = text_shdr->sh_addr;
+        new_shdr_ind = shdr_index(elf,text_shdr);
+    } else {
+        code_loc = (UWORD)new_elf + plt_shdr->sh_offset;
+        code_addr = plt_shdr->sh_addr;
+        new_shdr_ind = shdr_index(elf,plt_shdr);
+    }
     code_sz = dat_sz + REDIR_SZ;
+    if(new_shdr_ind == -1)
+        goto fail;
 
+    /* Mark where the new strtab goes */
     ElfN_Shdr *new_sht;
     new_sht = get_s_header(new_elf, ehdr->e_shstrndx);
     if(!new_sht)
         goto fail;
-    
-    /* Mark where the new strtab goes */
     UWORD shent_loc;
     shent_loc = (UWORD)new_elf + new_sht->sh_offset 
         + new_sht->sh_size;
@@ -785,16 +836,13 @@ int inject_section(char *elf, size_t elf_sz, char *dat,
     new_sht = get_s_header(new_elf, ehdr->e_shstrndx);
     if(!new_sht)
         goto fail;
-    text_shdr = get_s_header(new_elf, text_shdr_ind);
-    if(!text_shdr)
-        goto fail;
     new_dyn_shdr = get_s_header(new_elf, dyn_shdr_ind);
     if(!new_dyn_shdr)
         goto fail;
 
     /* Make room for the new code */
     ElfN_Shdr *prev_hdr;
-    prev_hdr = get_s_header(new_elf, text_shdr_ind - 1);
+    prev_hdr = get_s_header(new_elf, new_shdr_ind - 1);
     if(!prev_hdr)
         goto fail;
     bias = expand_section(elf,new_elf, prev_hdr, new_dyn_shdr, 
@@ -805,10 +853,7 @@ int inject_section(char *elf, size_t elf_sz, char *dat,
     new_sht = get_s_header(new_elf, ehdr->e_shstrndx);
     if(!new_sht)
         goto fail;
-    text_shdr = get_s_header(new_elf, text_shdr_ind);
-    if(!text_shdr)
-        goto fail;
-    prev_hdr = get_s_header(new_elf, text_shdr_ind - 1);
+    prev_hdr = get_s_header(new_elf, new_shdr_ind - 1);
     if(!prev_hdr)
         goto fail;
 
@@ -845,27 +890,23 @@ int inject_section(char *elf, size_t elf_sz, char *dat,
             sect_name,
             bytes_to_copy);
 
-    /* Mark where the new section header will be */
-    UWORD new_shdr_loc;
-    new_shdr_loc = (UWORD)new_elf + new_ehdr->e_shoff 
-        + (ehdr->e_shentsize * ehdr->e_shnum);
-
-    /* Insert our new section header at the end of the table */
+    /* Insert the new section header before the .text section
+     *  header */
     ElfN_Shdr *new_shdr;
-    new_shdr = (ElfN_Shdr *)new_shdr_loc;
-    memset(new_shdr, 0, sizeof(ElfN_Shdr));
+    new_shdr = insert_section_hdr(new_elf, new_shdr_ind); 
+    if(!new_shdr)
+        goto fail;
     new_shdr->sh_name = str_ind; /* Name index in strtab */
     new_shdr->sh_type = SHT_PROGBITS; /* Contains prog code */
     new_shdr->sh_flags = SHF_EXECINSTR | SHF_ALLOC;
     new_shdr->sh_offset = code_loc - (UWORD)new_elf; 
-    new_shdr->sh_addr = base_addr; 
+    new_shdr->sh_addr = code_addr; 
     new_shdr->sh_size = dat_sz + REDIR_SZ;
     new_shdr->sh_addralign = 4;
     bytes_written += sizeof(ElfN_Shdr);
 
-    /* Set the new entry point and increment the sh_num */
+    /* Set the new entry point */
     new_ehdr->e_entry = new_shdr->sh_addr;
-    new_ehdr->e_shnum++;
 
     /* Finally set the jmp target */
     UWORD old_entry, new_entry;
@@ -985,4 +1026,3 @@ fail:
         free(elf_dat);
     return 1;
 }
-
