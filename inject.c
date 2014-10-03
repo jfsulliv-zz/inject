@@ -88,11 +88,13 @@ int main(int argc, char **argv, char **envp)
     char *elf = argv[2];
 
     FILE *shell_f, *elf_f;
+    shell_f = NULL;
+    elf_f = NULL;
     char *shell_dat, *elf_dat, *new_elf_dat;
     shell_dat = NULL;
     elf_dat = NULL;
     new_elf_dat = NULL;
-    int shell_sz, elf_sz, new_elf_sz;
+    size_t shell_sz, elf_sz, new_elf_sz;
 
     /* Read in the shellcode from the data file */
     shell_f = fopen(shell, "rb");

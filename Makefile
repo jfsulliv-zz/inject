@@ -1,4 +1,4 @@
-CC=gcc
+CC=gcc 
 CFLAGS=-g -Wall 
 
 all: clean inject
