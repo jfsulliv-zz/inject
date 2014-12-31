@@ -11,12 +11,12 @@
 #include "elf_tools.h"
 
 /* 
- * Contains a variety of ELF related tools for parsing,
- *  dissecting, and modifying ELFS.
+ * Contains a variety of ELF related tools for parsing, dissecting,
+ * and modifying ELFS.
  *
  * NB: This is a very large file to do a very large amount of work.
- *  Most of this is due to the decision to insert the section and its
- *  data into the middle of the ELF, which is a fairly involved task.
+ * Most of this is due to the decision to insert the section and its
+ * data into the middle of the ELF, which is a fairly involved task.
  */
 
 const char JMP_INSTR    = ARCH_JUMP_INSTR;
@@ -218,7 +218,7 @@ int get_align_bias(char *elf, ElfN_Shdr *shdr, int n)
     shdr_next = get_s_header(elf,i+1);
     if(!shdr_next)
         return bias;
-    
+
     return get_align_bias(elf, shdr_next, bias); 
 }
 
@@ -332,6 +332,7 @@ int rearrange_relocs(char *elf, void *base, void *top,
     int sh_num;
     sh_num = 0;
     ElfN_Shdr *shdr;
+    ElfN_Shdr *linked;
 
     /* Have to check every section */
     while((shdr = get_s_header(elf,sh_num++))) {
@@ -359,6 +360,17 @@ int rearrange_relocs(char *elf, void *base, void *top,
                 rel = (ElfN_Rel *)addr;
                 if((UWORD)rel->r_offset >= (UWORD)base
                         && (UWORD)rel->r_offset < (UWORD)top) {
+                    /* Fix up the symbol in the linked section */
+                    linked = get_s_header(elf, 
+                            shdr->sh_link);
+                    UWORD sym_addr;
+                    ElfN_Sym *sym;
+                    int sym_ind = ELFN_R_SYM(rel->r_info);
+                    sym_addr = (UWORD)elf + linked->sh_offset;
+                    sym_addr += linked->sh_entsize * sym_ind; 
+                    sym = (ElfN_Sym *)sym_addr;
+                    if(rel->r_offset == sym->st_value)
+                        sym->st_value += n;
                     rel->r_offset += n;
                 }
             }
@@ -370,7 +382,8 @@ int rearrange_relocs(char *elf, void *base, void *top,
 
 /* 
  * Shifts the address of all symtab section entries by n bytes,
- *  if they are between base and top.
+ *  if they are between base and top. Also increases the Symbol's
+ *  st_shndx by 1 if there is a new section below its current st_shndx.
  * Returns 0 on success, 1 on failure
  */
 int rearrange_syms(char *elf, void *base, void *top,
@@ -400,8 +413,43 @@ int rearrange_syms(char *elf, void *base, void *top,
                 if((UWORD)sym->st_value > 0) {
                     if((UWORD)sym->st_value >= (UWORD)base
                             && (UWORD)sym->st_value < (UWORD)top)
-                        sym->st_value += n;
+                        sym->st_value += n; 
                 }
+            }
+        }
+    }
+
+    return 0;
+}
+
+/* For every symbol in the ELF file, if its st_shndx is greater than the
+ * new section number, increment it.
+ * Returns 0 on success or 1 on failure.
+ */
+int inc_sym_indices(char *elf, int new_section_num)
+{
+    if(!elf)
+        return 1;
+
+    int sh_num;
+    sh_num = 0;
+    ElfN_Shdr *shdr;
+
+    while((shdr = get_s_header(elf,sh_num++))) {
+        /* Concerned with dynamic and regular symbol tables */
+        if(shdr->sh_type == SHT_DYNSYM 
+                || shdr->sh_type == SHT_SYMTAB) {
+            int num;
+            num = shdr->sh_size / sizeof(ElfN_Sym);
+            int i;
+            ElfN_Sym *sym;
+            for(i = 0; i < num; i++) {
+                UWORD addr;
+                addr = ((UWORD)elf + shdr->sh_offset 
+                        + (i * sizeof(ElfN_Sym)));
+                sym = (ElfN_Sym *)addr;
+                if(sym->st_shndx >= new_section_num)
+                    sym->st_shndx++;
             }
         }
     }
@@ -414,18 +462,20 @@ int rearrange_syms(char *elf, void *base, void *top,
  *  offsets from the original ELF.
  * The section header table may also be moved if it is at risk
  *  of overwrite.
- * Returns 0 on success and 1 on failure.
+ * Returns the bytes the header table was moved by on success and -1 
+ * on failure.
  */
 int map_sections(char *elf, char *new_elf)
 {
+    int ret = 0;
     if(!elf || !new_elf)
-        return 1;
+        return -1;
     ElfN_Ehdr *ehdr;
     ElfN_Ehdr *new_ehdr;
     ehdr = (ElfN_Ehdr *)elf;
     new_ehdr = (ElfN_Ehdr *)new_elf;
     if(ehdr->e_shnum != new_ehdr->e_shnum)
-        return 1;
+        return -1;
 
     UWORD sht_loc;
     sht_loc = (UWORD)new_elf + new_ehdr->e_shoff;
@@ -440,7 +490,7 @@ int map_sections(char *elf, char *new_elf)
         shdr = get_s_header(elf,i);
         new_shdr = get_s_header(new_elf,i);
         if(!shdr || !new_shdr)
-            return 1;
+            return -1;
 
         WORD diff;
         UWORD sz, old_sz;
@@ -453,9 +503,9 @@ int map_sections(char *elf, char *new_elf)
         old_sz = shdr->sh_size;
 
         UWORD shdr_addr;
-        shdr_addr = (UWORD)new_elf + new_shdr->sh_offset - diff;
+        shdr_addr = (UWORD)new_elf + shdr->sh_offset;
         /* Check if we're stomping our header table */
-        if(shdr_addr + sz >= sht_loc && shdr_addr + old_sz - diff < sht_loc) {
+        if(shdr_addr + sz + diff >= sht_loc && shdr_addr + old_sz < sht_loc) {
             int size_diff;
             size_diff = sz - old_sz;
             memmove((void *)sht_loc + diff + size_diff,
@@ -465,6 +515,7 @@ int map_sections(char *elf, char *new_elf)
             new_ehdr->e_shoff += (diff + size_diff);
             sht_loc += (diff + size_diff);
             new_shdr = get_s_header(new_elf, i);
+            ret += diff + size_diff;
         } 
 
         /* If this section contains relocatable objects
@@ -475,15 +526,21 @@ int map_sections(char *elf, char *new_elf)
                     (void *)new_shdr->sh_addr,
                     (void *)new_shdr->sh_addr + sz,
                     diff);
+            rearrange_syms(new_elf,
+                    (void *)new_shdr->sh_addr,
+                    (void *)new_shdr->sh_addr + sz,
+                    diff);
         }
 
         /* Now we can move the section */ 
-        memmove((void *)shdr_addr + diff,
-                (void *)shdr_addr,
-                sz);
+        if(shdr->sh_type != SHT_NOBITS) {
+            memmove((void *)shdr_addr + diff,
+                    (void *)shdr_addr,
+                    sz);
+        }
     }
 
-    return 0;
+    return ret;
 }
 
 /* 
@@ -500,6 +557,9 @@ int shift_sh_offsets(char *elf, ElfN_Shdr *shdr,
     if(!elf || !shdr)
         return 0;
 
+    UWORD base = shdr->sh_addr;
+    UWORD top  = base + shdr->sh_size;
+
     int i;
     i = shdr_index(elf, shdr);
     if(i == -1)
@@ -509,21 +569,25 @@ int shift_sh_offsets(char *elf, ElfN_Shdr *shdr,
     bias = get_align_bias(elf, shdr, n);
 
     while((shdr = get_s_header(elf,i++))) {
-        /* Any dynamic objects that live in this section
-         * must be shifted; do this after to guarantee we don't
-         * shift our dyn table */
-        if(dyn_shdr) {
-            rearrange_dynamic(elf, dyn_shdr,
-                    (void *)shdr->sh_addr,
-                    (void *)shdr->sh_addr + shdr->sh_size,
-                    bias);
-        }
-
         /* Now we can inc the offset and address by the bias */
         shdr->sh_offset += bias;
         if(shdr->sh_addr) 
             shdr->sh_addr += bias;
+        if(top < shdr->sh_addr + shdr->sh_size)
+            top = shdr->sh_addr + shdr->sh_size;
     }
+    /* Any dynamic objects that live in any shifted section
+     * must be shifted; do this after to guarantee we don't
+     * shift our dyn table */
+    if(dyn_shdr && base > 0) {
+        dyn_shdr->sh_offset -= bias;
+        rearrange_dynamic(elf, dyn_shdr,
+                (void *)base,
+                (void *)top,
+                bias);
+        dyn_shdr->sh_offset += bias;
+    }
+
 
     return bias;
 }
@@ -596,6 +660,9 @@ int fix_sh_links(char *elf, size_t index)
     while((shdr = get_s_header(elf,i++))) {
         if(shdr->sh_link >= index)
             shdr->sh_link++;
+        if(shdr->sh_type == SHT_REL || shdr->sh_type == SHT_RELA)
+            if(shdr->sh_info >= index)
+                shdr->sh_info++;
     }
     return 0;
 }
@@ -620,7 +687,7 @@ ElfN_Shdr *insert_section_hdr(char *old_elf, char *elf, ElfN_Shdr *dyn_shdr,
     ElfN_Ehdr *ehdr;
     ehdr = (ElfN_Ehdr *)elf;
 
-    if(index > ehdr->e_shnum)
+    if(index >= ehdr->e_shnum)
         return NULL;
 
     UWORD start_addr;
@@ -644,6 +711,8 @@ ElfN_Shdr *insert_section_hdr(char *old_elf, char *elf, ElfN_Shdr *dyn_shdr,
      *  to increment sh_link to account for the new index. 
      */
     fix_sh_links(elf, index);
+    /* Do the same for symbols with a shndx */
+    inc_sym_indices(elf,index);
     /* Increment shnum */
     ehdr->e_shnum++;
 
@@ -748,8 +817,9 @@ int inject_section(char *elf, size_t elf_sz, char *dat,
         new_shdr_ind = shdr_index(elf,text_shdr);
     } else {
         code_loc = (UWORD)new_elf + plt_shdr->sh_offset;
-        code_addr = plt_shdr->sh_addr;
-        new_shdr_ind = shdr_index(elf,plt_shdr);
+        code_loc += plt_shdr->sh_size;
+        code_addr = plt_shdr->sh_addr + plt_shdr->sh_size;
+        new_shdr_ind = shdr_index(elf,plt_shdr+1);
     }
     code_sz = dat_sz + REDIR_SZ;
     if(new_shdr_ind == -1)
@@ -783,7 +853,7 @@ int inject_section(char *elf, size_t elf_sz, char *dat,
     /* Make room for the new section header */
     int i;
     i = 0;
-    while((prev_hdr = get_s_header(elf, i++))) {
+    while((prev_hdr = get_s_header(new_elf, i++))) {
         if(prev_hdr->sh_offset >= ehdr->e_shoff) 
             break;
     }
@@ -791,11 +861,16 @@ int inject_section(char *elf, size_t elf_sz, char *dat,
         prev_hdr = get_s_header(new_elf, i-2);
         bias = expand_section(new_elf, prev_hdr, new_dyn_shdr,
                 ehdr->e_shentsize);
+        bytes_written += bias;
         prev_hdr->sh_size -= ehdr->e_shentsize;
     }
 
     /* Now that the offsets are set up, move the actual memory locations */
-    map_sections(elf,new_elf);
+    bias = map_sections(elf,new_elf);
+    if(bias < 0)
+        goto fail;
+    bytes_written += bias;
+
 
     /* Now we can inject the new code */
     bytes_to_copy = dat_sz;

@@ -14,6 +14,8 @@
 #define ElfN_Rel     Elf64_Rel
 #define ElfN_Rela    Elf64_Rela
 #define ElfN_Sym     Elf64_Sym
+#define ELFN_R_SYM   ELF64_R_SYM
+#define ELFN_R_SYM_SHIFT 32
 #define print_addr(format, ...) do {            \
     printf(format "0x%016Lx",                   \
             (unsigned long long)__VA_ARGS__);   \
@@ -30,7 +32,9 @@
 #define ElfN_Dyn     Elf32_Dyn
 #define ElfN_Rel     Elf32_Rel
 #define ElfN_Rela    Elf32_Rela
-#define ElfN_Sym     Elf64_Sym
+#define ElfN_Sym     Elf32_Sym
+#define ELFN_R_SYM   ELF32_R_SYM
+#define ELFN_R_SYM_SHIFT 8
 #define print_addr(format, ...) do {            \
     printf(format "0x%08x",                     \
             (unsigned int)__VA_ARGS__);         \
